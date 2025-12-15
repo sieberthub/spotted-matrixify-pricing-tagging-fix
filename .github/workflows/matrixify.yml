@@ -1,22 +1,15 @@
-name: Matrixify Build Imports (Arigato Logic)
+name: Matrixify Pricing & Tagging Fix (one-off)
 
 on:
   workflow_dispatch:
     inputs:
-      CSV_URL:
-        description: "Direkter Download-Link zur Matrixify Export CSV"
-        required: true
-      TEST_PRODUCTS:
-        description: "0 = kein Test, z.B. 20 = test files erzeugen"
+      TEST_SIZE:
+        description: "Anzahl Test-Produkte (z.B. 20)"
         required: true
         default: "20"
-      BUILD_FULL:
-        description: "true = full corrected export bauen (kann groß werden)"
-        required: true
-        default: "false"
 
 jobs:
-  build:
+  run:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -27,18 +20,13 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install deps
-        run: npm install
-
-      - name: Run
+      - name: Run script
         env:
-          CSV_URL: ${{ inputs.CSV_URL }}
-          TEST_PRODUCTS: ${{ inputs.TEST_PRODUCTS }}
-          BUILD_FULL: ${{ inputs.BUILD_FULL }}
-        run: node src/matrixify-run.mjs
+          TEST_SIZE: ${{ inputs.TEST_SIZE }}
+        run: node src/run.mjs
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: matrixify-out
+          name: matrixify-output
           path: out/**
