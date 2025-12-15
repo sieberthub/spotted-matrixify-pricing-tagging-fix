@@ -6,7 +6,7 @@ on:
       INPUT_CSV:
         description: "Pfad zur Matrixify Export CSV im Repo"
         required: true
-        default: "data/product.csv"
+        default: "data/Product.csv"
       VAT_RATE:
         description: "VAT (z.B. 0.20)"
         required: true
