@@ -1,47 +1,98 @@
 import fs from "node:fs";
 import path from "node:path";
-import { parse } from "csv-parse";
-import { stringify } from "csv-stringify";
+import readline from "node:readline";
 
-const OUT_DIR = "out";
+const IN_FILE = process.env.IN_FILE || "data/Products.csv";
+const OUT_DIR = process.env.OUT_DIR || "out";
+const TEST_SIZE = Number(process.env.TEST_SIZE || "20");
+
+const T_VAT = 0.20;
+const TYPE_TAGS = ["used", "standard", "low-margin"];
+
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
-/**
- * INPUTS (workflow_dispatch)
- */
-const CSV_URL = process.env.CSV_URL || "";
-const CSV_PATH = process.env.CSV_PATH || ""; // optional: falls Datei schon im Repo liegt
-const TEST_PRODUCTS = Number(process.env.TEST_PRODUCTS || "0"); // z.B. 20
-const BUILD_FULL = (process.env.BUILD_FULL || "false").toLowerCase() === "true";
+/** ---------- CSV parsing (Matrixify) ---------- */
+function parseCsvLine(line) {
+  const out = [];
+  let cur = "";
+  let inQuotes = false;
 
-/**
- * Arigato Konstanten / VAT
- */
-const T_VAT = 0.20;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
 
-// ----------------- Helpers -----------------
-function normTag(t) { return String(t || "").toLowerCase().trim(); }
+    if (ch === '"') {
+      if (inQuotes && line[i + 1] === '"') {
+        cur += '"';
+        i++;
+      } else {
+        inQuotes = !inQuotes;
+      }
+      continue;
+    }
+
+    if (ch === "," && !inQuotes) {
+      out.push(cur);
+      cur = "";
+      continue;
+    }
+
+    cur += ch;
+  }
+  out.push(cur);
+  return out;
+}
+
+function csvEscape(v) {
+  const s = String(v ?? "");
+  if (s.includes('"') || s.includes(",") || s.includes("\n")) return `"${s.replaceAll('"', '""')}"`;
+  return s;
+}
+
+function writeCsv(filePath, headers, rows) {
+  const lines = [];
+  lines.push(headers.join(","));
+  for (const r of rows) {
+    lines.push(headers.map(h => csvEscape(r[h] ?? "")).join(","));
+  }
+  fs.writeFileSync(filePath, lines.join("\n"));
+}
+
+function splitTags(s) {
+  if (!s) return [];
+  return String(s)
+    .split(",")
+    .map(t => t.trim())
+    .filter(Boolean);
+}
+
+function normTag(t) { return String(t || "").trim().toLowerCase(); }
+
+function toNumberOrNull(x) {
+  const s = String(x ?? "").trim();
+  if (!s) return null;
+  const n = Number(s.replace(",", "."));
+  return Number.isFinite(n) ? n : null;
+}
+
+function round2(x) { return Math.round(x * 100) / 100; }
+function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
+
 function approxEqualMoney(a, b) {
   const na = Number(a);
   const nb = Number(b);
   if (!Number.isFinite(na) || !Number.isFinite(nb)) return false;
   return Math.abs(na - nb) < 0.005;
 }
-function round2(x) { return Math.round(x * 100) / 100; }
-function clamp(x, a, b) { return Math.max(a, Math.min(b, x)); }
 
-function hasUsedGateway(tagsStr) {
-  // tagsStr ist Matrixify typischerweise "tag1, tag2, ..."
-  const tags = String(tagsStr || "")
-    .split(",")
-    .map(normTag)
-    .filter(Boolean);
-  return tags.includes("preowned / defect") || tags.includes("preloved");
+function hasUsedGateway(tags) {
+  const lower = (tags || []).map(normTag);
+  return lower.includes("preowned / defect") || lower.includes("preloved");
 }
 
-function determineTypeArigato(M_net, C_net, tagsStr) {
+/** ---------- Arigato Block 1: Type Decision ---------- */
+function determineTypeArigato(M_net, C_net, tags) {
   if (!(M_net > 0) || !(C_net > 0)) return "skip";
-  if (hasUsedGateway(tagsStr)) return "used";
+  if (hasUsedGateway(tags)) return "used";
 
   const d_max = 0.55;
   const ship_cost = 12.9;
@@ -60,14 +111,12 @@ function determineTypeArigato(M_net, C_net, tagsStr) {
   return (G >= 0) ? "standard" : "low-margin";
 }
 
+/** ---------- Arigato Worker JS: Pricing ---------- */
 function computePricing(M_net, C_net, type) {
   if (!(M_net > 0) || !(C_net > 0)) return { ok: false };
 
-  // Used
   const U = { alpha: 0.15, beta: 1.10, gamma: 0.20, N: 40.00, K0: 500.0, k: 500.0 };
-  // Low-margin
   const LM = { alpha: 0.16, beta: 0.25, gamma: 0.40, N: 35.00, K0: 300.0, k: 500.0 };
-  // Standard
   const STD = {
     d_max: 0.50,
     mu0: 0.75,
@@ -115,357 +164,384 @@ function computePricing(M_net, C_net, type) {
   return { ok: true, price_new: round2(price_new), as_low_as: round2(as_low_as) };
 }
 
-const TYPE_TAGS = ["used", "standard", "low-margin"];
+/** ---------- Tags: nur 3 Typ-Tags anfassen ---------- */
+function computeTagOps(currentTags, desiredType) {
+  const cur = currentTags || [];
+  const curLower = cur.map(normTag);
 
-function computeDesiredTags(tagsStr, desiredType) {
-  const original = String(tagsStr || "").split(",").map(t => t.trim()).filter(Boolean);
-  const cleaned = original.filter(t => !TYPE_TAGS.includes(normTag(t)));
-  const lower = original.map(normTag);
-
-  if (TYPE_TAGS.includes(desiredType) && !lower.includes(desiredType)) cleaned.push(desiredType);
-
-  // tags_to_add/remove (Arigato-like)
   const tags_to_add = [];
   const tags_to_remove = [];
 
-  if (TYPE_TAGS.includes(desiredType) && !lower.includes(desiredType)) tags_to_add.push(desiredType);
+  if (TYPE_TAGS.includes(desiredType) && !curLower.includes(desiredType)) tags_to_add.push(desiredType);
   for (const t of TYPE_TAGS) {
-    if (t !== desiredType && lower.includes(t)) tags_to_remove.push(t);
+    if (t !== desiredType && curLower.includes(t)) tags_to_remove.push(t);
   }
 
-  return {
-    tags: cleaned.join(", "),
-    tags_to_add,
-    tags_to_remove
-  };
+  // Desired tags list: remove existing type-tags, add correct one
+  const cleaned = cur.filter(t => !TYPE_TAGS.includes(normTag(t)));
+  const desiredTags = cleaned.slice();
+  if (TYPE_TAGS.includes(desiredType) && !desiredTags.map(normTag).includes(desiredType)) desiredTags.push(desiredType);
+
+  const doTags = (tags_to_add.length > 0 || tags_to_remove.length > 0);
+  return { desiredTags, tags_to_add, tags_to_remove, doTags };
 }
 
-async function download(url, filePath) {
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Download failed: ${resp.status}`);
-  const buf = Buffer.from(await resp.arrayBuffer());
-  fs.writeFileSync(filePath, buf);
-}
+/** ---------- Read Matrixify CSV → group by product ---------- */
+async function readMatrixify(file) {
+  const rs = fs.createReadStream(file);
+  const rl = readline.createInterface({ input: rs, crlfDelay: Infinity });
 
-// ----------------- CSV read (stream) -----------------
-async function readMatrixifyCsv(csvFile) {
-  return new Promise((resolve, reject) => {
-    const products = new Map();
-    let headers = null;
+  let headers = null;
+  const products = new Map();
 
-    const parser = parse({
-      columns: true,
-      bom: true,
-      relax_column_count: true,
-      skip_empty_lines: true
-    });
-
-    parser.on("readable", () => {
-      let row;
-      while ((row = parser.read())) {
-        if (!headers) headers = Object.keys(row);
-
-        const productId = row["ID"] || "";
-        const variantId = row["Variant ID"] || "";
-        if (!productId) continue;
-
-        if (!products.has(productId)) {
-          products.set(productId, {
-            id: productId,
-            handle: row["Handle"] || "",
-            title: row["Title"] || "",
-            status: row["Status"] || "",
-            tags: row["Tags"] || "",
-            asLowAsCol: findAsLowAsColumn(headers),
-            rows: [],
-            variants: []
-          });
-        }
-
-        const p = products.get(productId);
-        p.rows.push(row);
-
-        // Variant Position kann leer sein
-        const posRaw = row["Variant Position"];
-        const position = Number(posRaw || "999999");
-
-        // wir lesen Compare At / Cost / Price aus Variant-Zeile
-        const v = {
-          variantId,
-          position,
-          price: row["Variant Price"],
-          compareAt: row["Variant Compare At Price"],
-          cost: row["Variant Cost"]
-        };
-        p.variants.push(v);
-      }
-    });
-
-    parser.on("error", reject);
-    parser.on("end", () => resolve({ products, headers }));
-
-    fs.createReadStream(csvFile).pipe(parser);
-  });
-}
-
-function findAsLowAsColumn(headers) {
-  // Matrixify schreibt Metafield Spalten oft als "Metafield: spotted.as_low_as" oder "Metafield: spotted.as_low_as [number_decimal]"
-  const h = headers.find(x => String(x).toLowerCase().startsWith("metafield: spotted.as_low_as"));
-  return h || null;
-}
-
-// ----------------- CSV write -----------------
-async function writeCsv(filePath, rows, columns) {
-  return new Promise((resolve, reject) => {
-    const out = fs.createWriteStream(filePath);
-    const s = stringify({ header: true, columns });
-    s.on("error", reject);
-    out.on("finish", resolve);
-    s.pipe(out);
-    for (const r of rows) s.write(r);
-    s.end();
-  });
-}
-
-// ----------------- Main transform -----------------
-async function main() {
-  const inputPath = path.join(OUT_DIR, "matrixify-export.csv");
-
-  if (CSV_PATH) {
-    fs.copyFileSync(CSV_PATH, inputPath);
-    console.log(`Using CSV_PATH → ${inputPath}`);
-  } else {
-    if (!CSV_URL) throw new Error("Missing CSV_URL (Matrixify export download link)");
-    console.log("Downloading CSV…");
-    await download(CSV_URL, inputPath);
-    console.log(`Downloaded → ${inputPath}`);
-  }
-
-  console.log("Reading + grouping by product…");
-  const { products } = await readMatrixifyCsv(inputPath);
-
-  const preview = [];
-  const productImportRows = [];
-  const variantImportRows = [];
-  const fullCorrectedRows = [];
-
-  // Stats
-  let totalProducts = 0;
-  let needChangeProducts = 0;
-  let drafted = 0;
-  const byType = { used: 0, standard: 0, "low-margin": 0, skip: 0 };
-
-  // For test subset selection
-  const changedProductIds = [];
-
-  for (const p of products.values()) {
-    totalProducts++;
-
-    // Base variant = kleinste Variant Position
-    const base = [...p.variants].sort((a, b) => a.position - b.position)[0] || null;
-
-    const msrpGross = Number(base?.compareAt || 0) || 0;
-    const M_net = msrpGross > 0 ? (msrpGross / (1 + T_VAT)) : 0;
-    const C_net = Number(base?.cost || 0) || 0;
-
-    const missingMC = !(M_net > 0 && C_net > 0);
-    const desiredStatus = missingMC ? "draft" : (p.status || "");
-    const doDraft = missingMC && String(p.status || "").toLowerCase() !== "draft";
-    if (doDraft) drafted++;
-
-    const type = missingMC ? "skip" : determineTypeArigato(M_net, C_net, p.tags);
-    byType[type] = (byType[type] || 0) + 1;
-
-    const pricing = (!missingMC && TYPE_TAGS.includes(type))
-      ? computePricing(M_net, C_net, type)
-      : { ok: false };
-
-    const price_new = pricing.ok ? String(pricing.price_new) : "";
-    const as_low_as_new = (pricing.ok && type === "standard" && pricing.as_low_as > 0)
-      ? String(pricing.as_low_as).replace(",", ".")
-      : "";
-
-    const asLowAsCol = p.asLowAsCol;
-    const as_low_as_old = asLowAsCol ? String(p.rows[0]?.[asLowAsCol] || "") : "";
-
-    // Tags
-    const tagRes = (!missingMC && TYPE_TAGS.includes(type))
-      ? computeDesiredTags(p.tags, type)
-      : { tags: p.tags || "", tags_to_add: [], tags_to_remove: [] };
-
-    const tagsChanged = normTag(p.tags) !== normTag(tagRes.tags);
-
-    // Prices per variant: nur die wirklich abweichenden Variants exportieren
-    const variantChanges = [];
-    if (!missingMC && pricing.ok && price_new) {
-      for (const v of p.variants) {
-        if (v.variantId && !approxEqualMoney(v.price, price_new)) {
-          variantChanges.push({ variantId: v.variantId, price: price_new });
-        }
-      }
-    }
-    const doPrice = variantChanges.length > 0;
-
-    // Metafield diff (nur standard)
-    const doMetafield =
-      !missingMC &&
-      type === "standard" &&
-      as_low_as_new &&
-      (!as_low_as_old || !approxEqualMoney(as_low_as_old, as_low_as_new));
-
-    const needsChange = doDraft || tagsChanged || doPrice || doMetafield;
-    if (needsChange) {
-      needChangeProducts++;
-      changedProductIds.push(p.id);
-    }
-
-    preview.push({
-      productId: p.id,
-      title: (p.title || "").replaceAll(",", " "),
-      status_current: p.status,
-      status_desired: desiredStatus,
-      type,
-      msrp_gross: msrpGross ? round2(msrpGross) : "",
-      M_net: M_net ? round2(M_net) : "",
-      C_net: C_net ? round2(C_net) : "",
-      base_variant_position: base?.position ?? "",
-      price_old_base: base?.price ?? "",
-      price_new,
-      as_low_as_old,
-      as_low_as_new,
-      tags_to_add: tagRes.tags_to_add.join("|"),
-      tags_to_remove: tagRes.tags_to_remove.join("|"),
-      needsChange
-    });
-
-    if (!needsChange) {
-      if (BUILD_FULL) fullCorrectedRows.push(...p.rows);
+  for await (const line of rl) {
+    if (!headers) {
+      headers = parseCsvLine(line);
       continue;
     }
+    if (!line.trim()) continue;
 
-    // ---------- Products import row (1 row / product) ----------
-    // Wir geben IMMER komplette Tag-Liste + Status mit (nur für Produkte, die wir anfassen).
-    const productRow = {
-      "ID": p.id,
-      "Command": "UPDATE",
-      "Status": desiredStatus || p.status || "",
-      "Tags": tagRes.tags || p.tags || "",
-      "Tags Command": "REPLACE"
-    };
+    const vals = parseCsvLine(line);
+    const row = {};
+    for (let i = 0; i < headers.length; i++) row[headers[i]] = vals[i] ?? "";
 
-    // Metafield nur setzen wenn Spalte existiert
-    if (asLowAsCol) {
-      productRow[asLowAsCol] = (type === "standard") ? (doMetafield ? as_low_as_new : as_low_as_old) : (as_low_as_old || "");
-    }
+    const pid = row["ID"];
+    if (!pid) continue;
 
-    productImportRows.push(productRow);
-
-    // ---------- Variant price rows ----------
-    for (const vc of variantChanges) {
-      variantImportRows.push({
-        "Variant ID": vc.variantId,
-        "Variant Command": "UPDATE",
-        "Variant Price": vc.price
+    if (!products.has(pid)) {
+      products.set(pid, {
+        id: pid,
+        handle: row["Handle"] || "",
+        title: row["Title"] || "",
+        status: row["Status"] || "",
+        tagsRaw: row["Tags"] || "",
+        asLowAsRaw: row["Metafield: spotted.as_low_as [number_decimal]"] || "",
+        variants: []
       });
     }
 
-    // ---------- Full corrected (optional) ----------
-    if (BUILD_FULL) {
-      for (const row of p.rows) {
-        const outRow = { ...row };
+    const p = products.get(pid);
+    p.variants.push({
+      variantId: row["Variant ID"] || "",
+      position: toNumberOrNull(row["Variant Position"]) ?? 999999,
+      price: toNumberOrNull(row["Variant Price"]),
+      compareAt: toNumberOrNull(row["Variant Compare At Price"]),
+      cost: toNumberOrNull(row["Variant Cost"])
+    });
+  }
 
-        // Tags/Status auf jeder Zeile (full)
-        outRow["Tags"] = tagRes.tags || outRow["Tags"];
-        outRow["Status"] = desiredStatus || outRow["Status"];
+  return { products };
+}
 
-        // Metafield auf jeder Zeile (full) – ok, weil wir Vollimport sowieso nur als Referenz bauen
-        if (asLowAsCol && type === "standard" && as_low_as_new) {
-          outRow[asLowAsCol] = as_low_as_new;
-        }
+function pickBaseVariant(p) {
+  const sorted = (p.variants || []).slice().sort((a, b) => a.position - b.position);
+  return sorted[0] || null;
+}
 
-        // Price auf Variant-Zeilen
-        if (row["Variant ID"] && price_new && variantChanges.some(x => x.variantId === row["Variant ID"])) {
-          outRow["Variant Price"] = price_new;
-        }
+function fmt2(n) {
+  if (n == null || !Number.isFinite(n)) return "";
+  return (Math.round(n * 100) / 100).toFixed(2);
+}
 
-        fullCorrectedRows.push(outRow);
+function normalizeMetafieldVal(s) {
+  const n = toNumberOrNull(s);
+  return n == null ? "" : fmt2(n);
+}
+
+/** ---------- Build Matrixify Import Rows ---------- */
+const IMPORT_HEADERS = [
+  "ID", "Handle", "Title", "Command",
+  "Tags", "Tags Command",
+  "Status",
+  "Metafield: spotted.as_low_as [number_decimal]",
+  "Variant ID", "Variant Command", "Variant Price"
+];
+
+// row template
+function baseImportRow(p) {
+  return {
+    "ID": p.id,
+    "Handle": p.handle,
+    "Title": p.title,
+    "Command": "UPDATE",
+    "Tags": "",
+    "Tags Command": "",
+    "Status": "",
+    "Metafield: spotted.as_low_as [number_decimal]": "",
+    "Variant ID": "",
+    "Variant Command": "",
+    "Variant Price": ""
+  };
+}
+
+function attachProductFields(row, computed) {
+  if (computed.doTags) {
+    row["Tags"] = computed.desiredTags.join(", ");
+    row["Tags Command"] = "REPLACE";
+  }
+  if (computed.doDraft) {
+    row["Status"] = "Draft";
+  }
+  if (computed.doMetafield) {
+    row["Metafield: spotted.as_low_as [number_decimal]"] = fmt2(computed.asLowAsNew);
+  }
+}
+
+/**
+ * onlyChanges:
+ * - wenn Preisänderungen: eine Zeile pro betroffener Variante (Variant Command=UPDATE)
+ *   und Produktfelder (Tags/Status/Metafield) nur auf der ersten Zeile
+ * - sonst: eine Zeile nur mit Produktfeldern
+ */
+function buildOnlyChangesRows(p, computed) {
+  const rows = [];
+
+  if (computed.variantUpdates.length > 0) {
+    computed.variantUpdates.forEach((vu, idx) => {
+      const r = baseImportRow(p);
+      r["Variant ID"] = vu.variantId;
+      r["Variant Command"] = "UPDATE";
+      r["Variant Price"] = fmt2(vu.priceNew);
+      if (idx === 0) attachProductFields(r, computed);
+      rows.push(r);
+    });
+    return rows;
+  }
+
+  // only product-level changes
+  const r = baseImportRow(p);
+  attachProductFields(r, computed);
+  rows.push(r);
+  return rows;
+}
+
+/**
+ * fullFixed:
+ * - schreibt für ALLE Produkte/Varianten die "korrekten" Zielwerte,
+ *   aber nur in unseren 4 Feldern (Tags/Status Draft/Metafield/Variant Price).
+ * - Produktfelder nur auf erster Variant-Zeile.
+ */
+function buildFullFixedRows(p, computed) {
+  const rows = [];
+  const vars = (p.variants || []).filter(v => v.variantId);
+
+  if (vars.length === 0) {
+    const r = baseImportRow(p);
+    attachProductFields(r, computed);
+    return [r];
+  }
+
+  vars
+    .slice()
+    .sort((a, b) => a.position - b.position)
+    .forEach((v, idx) => {
+      const r = baseImportRow(p);
+
+      // Variant price: nur wenn berechenbar (nicht skip/missing)
+      if (computed.priceNew != null && computed.canPriceWrite) {
+        r["Variant ID"] = v.variantId;
+        r["Variant Command"] = "UPDATE";
+        r["Variant Price"] = fmt2(computed.priceNew);
       }
+
+      if (idx === 0) attachProductFields(r, computed);
+      rows.push(r);
+    });
+
+  return rows;
+}
+
+/** ---------- Preview rows (product-level) ---------- */
+function previewRow(p, computed) {
+  return {
+    productId: p.id,
+    handle: p.handle,
+    title: p.title,
+    status_current: p.status,
+    status_desired: computed.doDraft ? "Draft" : p.status,
+    type: computed.type,
+    msrp_gross: computed.msrpGross != null ? fmt2(computed.msrpGross) : "",
+    M_net: computed.M_net != null ? fmt2(computed.M_net) : "",
+    C_net: computed.C_net != null ? fmt2(computed.C_net) : "",
+    price_new: computed.priceNew != null ? fmt2(computed.priceNew) : "",
+    as_low_as_old: normalizeMetafieldVal(p.asLowAsRaw),
+    as_low_as_new: computed.asLowAsNew != null ? fmt2(computed.asLowAsNew) : "",
+    tags_to_add: computed.tags_to_add.join("|"),
+    tags_to_remove: computed.tags_to_remove.join("|"),
+    doDraft: computed.doDraft ? "true" : "false",
+    doTags: computed.doTags ? "true" : "false",
+    doPrice: computed.variantUpdates.length > 0 ? "true" : "false",
+    doMetafield: computed.doMetafield ? "true" : "false",
+    needsChange: computed.needsChange ? "true" : "false"
+  };
+}
+
+function writePreviewCsv(filePath, rows) {
+  const headers = Object.keys(rows[0] || {});
+  writeCsv(filePath, headers, rows);
+}
+
+/** ---------- Main ---------- */
+async function main() {
+  if (!fs.existsSync(IN_FILE)) {
+    throw new Error(`Input not found: ${IN_FILE} (lege Products.csv unter data/Products.csv ab)`);
+  }
+
+  console.log(`Reading: ${IN_FILE}`);
+  const { products } = await readMatrixify(IN_FILE);
+
+  const previewAll = [];
+  const previewChanges = [];
+
+  const onlyChangesImportRows = [];
+  const fullFixedImportRows = [];
+
+  const changeProductsByType = { used: [], standard: [], "low-margin": [] };
+
+  let drafted = 0;
+  const byType = { used: 0, standard: 0, "low-margin": 0, skip: 0 };
+  let needChange = 0;
+
+  for (const p of products.values()) {
+    const tags = splitTags(p.tagsRaw);
+
+    const base = pickBaseVariant(p);
+    const msrpGross = base?.compareAt ?? null;                 // Variant Compare At Price (gross)
+    const M_net = (msrpGross != null && msrpGross > 0) ? (msrpGross / (1 + T_VAT)) : 0;
+    const C_net = base?.cost ?? 0;
+
+    const missingMC = !(M_net > 0 && C_net > 0);
+    const doDraft = missingMC && String(p.status).toLowerCase() !== "draft";
+    if (doDraft) drafted++;
+
+    const type = missingMC ? "skip" : determineTypeArigato(M_net, C_net, tags);
+    byType[type] = (byType[type] || 0) + 1;
+
+    const pricing = (!missingMC && ["used", "standard", "low-margin"].includes(type))
+      ? computePricing(M_net, C_net, type)
+      : { ok: false };
+
+    const priceNew = pricing.ok ? pricing.price_new : null;
+    const asLowAsNew = (pricing.ok && type === "standard" && pricing.as_low_as > 0) ? pricing.as_low_as : null;
+
+    const tagOps = (!missingMC && ["used", "standard", "low-margin"].includes(type))
+      ? computeTagOps(tags, type)
+      : { desiredTags: tags, tags_to_add: [], tags_to_remove: [], doTags: false };
+
+    // price diff per variant
+    const variantUpdates = [];
+    if (!missingMC && priceNew != null) {
+      for (const v of p.variants) {
+        if (!v.variantId) continue;
+        if (!approxEqualMoney(v.price, priceNew)) {
+          variantUpdates.push({ variantId: v.variantId, priceNew });
+        }
+      }
+    }
+
+    // metafield diff (only standard)
+    const currentAsLowAs = toNumberOrNull(p.asLowAsRaw);
+    const doMetafield =
+      !missingMC &&
+      type === "standard" &&
+      asLowAsNew != null &&
+      (!currentAsLowAs || !approxEqualMoney(currentAsLowAs, asLowAsNew));
+
+    const needsChange = doDraft || tagOps.doTags || variantUpdates.length > 0 || doMetafield;
+    if (needsChange) needChange++;
+
+    const computed = {
+      type,
+      msrpGross,
+      M_net,
+      C_net,
+      doDraft,
+      doTags: tagOps.doTags,
+      tags_to_add: tagOps.tags_to_add,
+      tags_to_remove: tagOps.tags_to_remove,
+      desiredTags: tagOps.desiredTags,
+      variantUpdates,
+      doMetafield,
+      priceNew,
+      asLowAsNew,
+      needsChange,
+      canPriceWrite: (!missingMC && ["used", "standard", "low-margin"].includes(type))
+    };
+
+    // Preview
+    const pr = previewRow(p, computed);
+    previewAll.push(pr);
+    if (needsChange) previewChanges.push(pr);
+
+    // For test selection
+    if (needsChange && (type === "used" || type === "standard" || type === "low-margin")) {
+      changeProductsByType[type].push(p.id);
+    }
+
+    // Build import rows
+    // Only-changes file: only if needsChange
+    if (needsChange) {
+      onlyChangesImportRows.push(...buildOnlyChangesRows(p, computed));
+    }
+
+    // Full-fixed file: always (but only our 4 fields)
+    // IMPORTANT: for missingMC we only write Status=Draft (if needed). No tags/price/metafield.
+    fullFixedImportRows.push(...buildFullFixedRows(p, computed));
+  }
+
+  // Stats
+  console.log(`Stats: totalProducts=${products.size}, needChange=${needChange}, drafted=${drafted}`);
+  console.log(`ByType: ${JSON.stringify(byType)}`);
+
+  // Write previews
+  writePreviewCsv(path.join(OUT_DIR, "preview.full.csv"), previewAll);
+  writePreviewCsv(path.join(OUT_DIR, "preview.only-changes.csv"), previewChanges);
+  console.log(`Preview written: out/preview.full.csv + out/preview.only-changes.csv`);
+
+  // Write importable CSVs
+  const fullPath = path.join(OUT_DIR, "matrixify.full-fixed.csv");
+  const changesPath = path.join(OUT_DIR, "matrixify.only-changes.csv");
+
+  writeCsv(fullPath, IMPORT_HEADERS, fullFixedImportRows);
+  writeCsv(changesPath, IMPORT_HEADERS, onlyChangesImportRows);
+
+  console.log(`Import written: out/matrixify.full-fixed.csv (rows=${fullFixedImportRows.length})`);
+  console.log(`Import written: out/matrixify.only-changes.csv (rows=${onlyChangesImportRows.length})`);
+
+  // Build TEST file with TEST_SIZE products (mix: standard + low-margin + used)
+  const pick = [];
+  const wantOrder = ["standard", "low-margin", "used"]; // du wolltest alle 3 Cases
+  for (const t of wantOrder) {
+    for (const pid of changeProductsByType[t] || []) {
+      if (pick.length >= TEST_SIZE) break;
+      if (!pick.includes(pid)) pick.push(pid);
+    }
+    if (pick.length >= TEST_SIZE) break;
+  }
+
+  // fallback: wenn zu wenig in einer Gruppe, fülle aus others
+  if (pick.length < TEST_SIZE) {
+    const all = [...(changeProductsByType.standard || []), ...(changeProductsByType["low-margin"] || []), ...(changeProductsByType.used || [])];
+    for (const pid of all) {
+      if (pick.length >= TEST_SIZE) break;
+      if (!pick.includes(pid)) pick.push(pid);
     }
   }
 
-  // Preview schreiben
-  await writeCsv(
-    path.join(OUT_DIR, "preview.only-changes.csv"),
-    preview.filter(x => x.needsChange),
-    Object.keys(preview[0] || {})
-  );
+  const pickSet = new Set(pick);
+  const testRows = onlyChangesImportRows.filter(r => pickSet.has(r["ID"]));
 
-  // Products changes import
-  const prodCols = Array.from(new Set([
-    "ID","Command","Status","Tags","Tags Command",
-    ...productImportRows.flatMap(r => Object.keys(r).filter(k => k.toLowerCase().startsWith("metafield: spotted.as_low_as")))
-  ]));
+  const testPath = path.join(OUT_DIR, `matrixify.test-${TEST_SIZE}.csv`);
+  writeCsv(testPath, IMPORT_HEADERS, testRows);
 
-  await writeCsv(
-    path.join(OUT_DIR, "matrixify.products.changes.csv"),
-    productImportRows,
-    prodCols
-  );
+  const testListPath = path.join(OUT_DIR, "test-products.csv");
+  fs.writeFileSync(testListPath, ["productId", ...pick].join("\n"));
 
-  // Variants changes import
-  await writeCsv(
-    path.join(OUT_DIR, "matrixify.variants.changes.csv"),
-    variantImportRows,
-    ["Variant ID","Variant Command","Variant Price"]
-  );
-
-  // Full corrected (optional)
-  if (BUILD_FULL) {
-    const fullCols = fullCorrectedRows.length ? Object.keys(fullCorrectedRows[0]) : [];
-    await writeCsv(
-      path.join(OUT_DIR, "matrixify.full.corrected.csv"),
-      fullCorrectedRows,
-      fullCols
-    );
-  }
-
-  // Test subset (20 Produkte)
-  if (TEST_PRODUCTS > 0) {
-    const testIds = new Set(changedProductIds.slice(0, TEST_PRODUCTS));
-
-    const testProd = productImportRows.filter(r => testIds.has(r["ID"]));
-    const testVar = variantImportRows.filter(r => {
-      // wir kennen Variant->Product nicht im variants file,
-      // daher machen wir’s simpel: aus Preview lesen wir welche Produkte changed sind,
-      // und nehmen alle Variant-Price-Updates die zu diesen Produkten gehören,
-      // indem wir in full data nach Variant IDs suchen wäre aufwendiger.
-      // => pragmatisch: wir bauen test variants über Preview: wir nehmen die ersten N Produkte und exportieren alle Variant Updates aus deren VariantChanges.
-      return true;
-    });
-
-    // Besser: Variante-Test file nur aus den ersten 20 Produkten generieren, indem wir die Preview nutzen:
-    // => schnell hack: wir erstellen testVar neu aus den IDs, indem wir im Export nochmal mappen.
-    // Für pragmatisch: wir nehmen die ersten X Varianten aus variantImportRows, bis wir genug haben.
-    const testVarPruned = variantImportRows.slice(0, 2000); // safe limit
-
-    await writeCsv(path.join(OUT_DIR, "test-20.products.csv"), testProd, prodCols);
-    await writeCsv(path.join(OUT_DIR, "test-20.variants.csv"), testVarPruned, ["Variant ID","Variant Command","Variant Price"]);
-  }
-
-  console.log(`Stats: totalProducts=${totalProducts}, needChangeProducts=${needChangeProducts}, drafted=${drafted}`);
-  console.log(`ByType: ${JSON.stringify(byType)}`);
-  console.log("Wrote:");
-  console.log(" - out/preview.only-changes.csv");
-  console.log(" - out/matrixify.products.changes.csv");
-  console.log(" - out/matrixify.variants.changes.csv");
-  if (TEST_PRODUCTS > 0) {
-    console.log(" - out/test-20.products.csv");
-    console.log(" - out/test-20.variants.csv");
-  }
-  if (BUILD_FULL) console.log(" - out/matrixify.full.corrected.csv");
+  console.log(`Test import written: out/matrixify.test-${TEST_SIZE}.csv`);
+  console.log(`Test products list: out/test-products.csv`);
 }
 
-main().catch(e => {
-  console.error(e);
+main().catch(err => {
+  console.error(err);
   process.exit(1);
 });
