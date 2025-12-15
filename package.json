@@ -1,1 +1,9 @@
-
+{
+  "name": "spotted-matrixify-pricing-tagging-fix",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "csv-parse": "^5.6.0",
+    "csv-stringify": "^6.5.1"
+  }
+}
