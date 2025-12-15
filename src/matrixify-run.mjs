@@ -350,6 +350,10 @@ async function main() {
     (metafieldColName ?? "Metafield: spotted.as_low_as [number_decimal]"),
   ];
 
+  // Fail-fast counters (optional but helpful to print)
+  let failfastStandardMissingMf = 0;
+  let failfastVariantBlankPrice = 0;
+
   for (const p of products.values()) {
     // base variant deterministisch: kleinste Variant Position (wie Shopify “first variant”)
     const base = p.variants.reduce((best, v) => (!best || v.pos < best.pos) ? v : best, null);
@@ -389,7 +393,7 @@ async function main() {
     }
     const doPrice = variantsToUpdate.length > 0;
 
-    // metafield change: nur Standard
+    // metafield change: nur Standard (für Preview/Reporting)
     const currentMf = toNumberOrNull(p.asLowAsCurrent);
     const doMetafield =
       !missingMC &&
@@ -441,27 +445,59 @@ async function main() {
     });
 
     // --- Build Matrixify import rows for this product ---
-    // Primary row carries product-level updates + (optional) base variant price update
     const primaryVariantId = base?.variantId || (p.variants[0]?.variantId ?? "");
 
-    // Metafield safety: if NOT changing metafield, keep existing value (if any) to avoid accidental clear
+    // ✅ Metafield safety (strong):
+    // For ALL standard products we ALWAYS write the computed as_low_as (even if unchanged),
+    // so Matrixify never receives an empty cell for standard rows.
+    // For non-standard: preserve existing exported value if present, otherwise leave empty.
     const mfCell =
-      doMetafield
+      (!missingMC && desiredType === "standard" && desiredAsLowAs != null)
         ? String(desiredAsLowAs)
         : (p.asLowAsCurrent ? String(p.asLowAsCurrent) : "");
+
+    // ✅ FAIL-FAST #1: standard must ALWAYS have a computed as_low_as
+    if (!missingMC && desiredType === "standard") {
+      const mfNum = toNumberOrNull(mfCell);
+      if (!(mfNum > 0)) {
+        failfastStandardMissingMf++;
+        throw new Error(
+          [
+            "FAIL-FAST: Standard-Produkt ohne gültiges spotted.as_low_as (würde ggf. Metafield löschen/leer lassen).",
+            `Product ID: ${p.productId}`,
+            `Handle: ${p.handle || "(empty)"}`,
+            `Title: ${p.title || "(empty)"}`,
+            `Computed desiredAsLowAs: ${desiredAsLowAs ?? "null"}`,
+            `mfCell: "${mfCell}"`,
+          ].join("\n")
+        );
+      }
+    }
 
     const tagsCellOut = tagDiff.doTags ? tagDiff.desiredTagsArr.join(", ") : "";
     const tagsCmdOut = tagDiff.doTags ? "REPLACE" : "";
 
     // ✅ STRUCTURE FIX:
-    // Only write Variant ID on the primary row if we also write Variant Command + Variant Price.
-    // Otherwise Matrixify assumes variant MERGE/UPDATE and then "Price can't be blank".
     const primaryHasPriceUpdate =
       doPrice && primaryVariantId && variantsToUpdate.includes(primaryVariantId);
 
     const primaryVariantIdOut = primaryHasPriceUpdate ? primaryVariantId : "";
     const primaryVariantCmdOut = primaryHasPriceUpdate ? "UPDATE" : "";
     const primaryVariantPriceOut = primaryHasPriceUpdate ? String(desiredPriceNew) : "";
+
+    // ✅ FAIL-FAST #2: if variant id is present, price must be present
+    if (primaryVariantIdOut && !primaryVariantPriceOut) {
+      failfastVariantBlankPrice++;
+      throw new Error(
+        [
+          "FAIL-FAST: Variant ID gesetzt, aber Variant Price leer (würde Matrixify-Fehler 'Price can't be blank' verursachen).",
+          `Product ID: ${p.productId}`,
+          `Variant ID: ${primaryVariantIdOut}`,
+          `Handle: ${p.handle || "(empty)"}`,
+          `Title: ${p.title || "(empty)"}`,
+        ].join("\n")
+      );
+    }
 
     importOnlyChangesRows.push({
       "ID": p.productId,
@@ -479,6 +515,21 @@ async function main() {
     if (doPrice) {
       for (const vid of variantsToUpdate) {
         if (!vid || vid === primaryVariantId) continue;
+
+        // Fail-fast also for extra variant rows
+        if (desiredPriceNew == null) {
+          failfastVariantBlankPrice++;
+          throw new Error(
+            [
+              "FAIL-FAST: Varianten-Update geplant, aber desiredPriceNew ist null.",
+              `Product ID: ${p.productId}`,
+              `Variant ID: ${vid}`,
+              `Handle: ${p.handle || "(empty)"}`,
+              `Title: ${p.title || "(empty)"}`,
+            ].join("\n")
+          );
+        }
+
         importOnlyChangesRows.push({
           "ID": p.productId,
           "Command": "UPDATE",
@@ -526,6 +577,7 @@ async function main() {
 
   console.log(`Stats: totalProducts=${products.size}, needChange=${changeItems.length}, drafted=${drafted}`);
   console.log(`ByType: ${JSON.stringify(byType)}`);
+  console.log(`FailFastCounters: standardMissingMf=${failfastStandardMissingMf}, variantBlankPrice=${failfastVariantBlankPrice}`);
   console.log(`✅ Wrote: ${prevFullPath}`);
   console.log(`✅ Wrote: ${prevOnlyPath}`);
   console.log(`✅ Wrote: ${importOnlyPath}`);
