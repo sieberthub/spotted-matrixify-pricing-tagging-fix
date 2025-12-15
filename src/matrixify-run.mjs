@@ -453,7 +453,15 @@ async function main() {
     const tagsCellOut = tagDiff.doTags ? tagDiff.desiredTagsArr.join(", ") : "";
     const tagsCmdOut = tagDiff.doTags ? "REPLACE" : "";
 
-    const primaryHasPriceUpdate = doPrice && primaryVariantId && variantsToUpdate.includes(primaryVariantId);
+    // ✅ STRUCTURE FIX:
+    // Only write Variant ID on the primary row if we also write Variant Command + Variant Price.
+    // Otherwise Matrixify assumes variant MERGE/UPDATE and then "Price can't be blank".
+    const primaryHasPriceUpdate =
+      doPrice && primaryVariantId && variantsToUpdate.includes(primaryVariantId);
+
+    const primaryVariantIdOut = primaryHasPriceUpdate ? primaryVariantId : "";
+    const primaryVariantCmdOut = primaryHasPriceUpdate ? "UPDATE" : "";
+    const primaryVariantPriceOut = primaryHasPriceUpdate ? String(desiredPriceNew) : "";
 
     importOnlyChangesRows.push({
       "ID": p.productId,
@@ -461,9 +469,9 @@ async function main() {
       "Tags": tagsCellOut,
       "Tags Command": tagsCmdOut,
       "Status": doDraft ? "Draft" : "",
-      "Variant ID": primaryVariantId,
-      "Variant Command": primaryHasPriceUpdate ? "UPDATE" : "",
-      "Variant Price": primaryHasPriceUpdate ? String(desiredPriceNew) : "",
+      "Variant ID": primaryVariantIdOut,
+      "Variant Command": primaryVariantCmdOut,
+      "Variant Price": primaryVariantPriceOut,
       [importHeaders[8]]: mfCell,
     });
 
