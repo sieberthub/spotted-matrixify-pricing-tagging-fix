@@ -10,7 +10,7 @@ import path from "node:path";
  *         out/matrixify.summary.json
  */
 
-const INPUT_CSV = process.env.INPUT_CSV || "data/Product.csv";
+const INPUT_CSV = process.env.INPUT_CSV || "data/matrixify/Products.csv";
 const VAT_RATE = Number(process.env.VAT_RATE || "0.20");
 const TEST_COUNT = Math.max(1, Number(process.env.TEST_COUNT || "20"));
 
