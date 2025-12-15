@@ -1,10 +1,18 @@
-name: Matrixify Pricing & Tagging Fix (one-off)
+name: Matrixify Pricing/Tagging Fix
 
 on:
   workflow_dispatch:
     inputs:
-      TEST_SIZE:
-        description: "Anzahl Test-Produkte (z.B. 20)"
+      INPUT_CSV:
+        description: "Pfad zur Matrixify Export CSV im Repo"
+        required: true
+        default: "data/product.csv"
+      VAT_RATE:
+        description: "VAT (z.B. 0.20)"
+        required: true
+        default: "0.20"
+      TEST_COUNT:
+        description: "Anzahl Produkte im Live-Test CSV"
         required: true
         default: "20"
 
@@ -20,10 +28,12 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Run script
+      - name: Run Matrixify processor
         env:
-          TEST_SIZE: ${{ inputs.TEST_SIZE }}
-        run: node src/run.mjs
+          INPUT_CSV: ${{ inputs.INPUT_CSV }}
+          VAT_RATE: ${{ inputs.VAT_RATE }}
+          TEST_COUNT: ${{ inputs.TEST_COUNT }}
+        run: node src/matrixify-run.mjs
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
