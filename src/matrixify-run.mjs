@@ -10,7 +10,7 @@ import path from "node:path";
  *         out/matrixify.summary.json
  */
 
-const INPUT_CSV = process.env.INPUT_CSV || "data/product.csv";
+const INPUT_CSV = process.env.INPUT_CSV || "data/Product.csv";
 const VAT_RATE = Number(process.env.VAT_RATE || "0.20");
 const TEST_COUNT = Math.max(1, Number(process.env.TEST_COUNT || "20"));
 
@@ -29,12 +29,12 @@ function existsAny(paths) {
 
 // Fallbacks, falls du doch Products.csv etc. hast:
 const inputResolved =
-  existsAny([INPUT_CSV, "data/Products.csv", "data/products.csv", "data/product.csv"]) || INPUT_CSV;
+  existsAny([INPUT_CSV, "data/Products.csv", "data/products.csv", "data/Product.csv"]) || INPUT_CSV;
 
 if (!fs.existsSync(inputResolved)) {
   die(
     `Input CSV nicht gefunden: ${INPUT_CSV}\n` +
-      `Tipp: Leg die Datei ins Repo unter data/product.csv (oder setz INPUT_CSV entsprechend).`
+      `Tipp: Leg die Datei ins Repo unter data/Product.csv (oder setz INPUT_CSV entsprechend).`
   );
 }
 
