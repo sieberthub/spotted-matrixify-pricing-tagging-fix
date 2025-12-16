@@ -7,10 +7,6 @@ on:
         description: "Pfad zur Matrixify Export CSV im Repo"
         required: true
         default: "data/matrixify/Products.csv"
-      VAT_RATE:
-        description: "VAT (z.B. 0.20)"
-        required: true
-        default: "0.20"
       TEST_COUNT:
         description: "Anzahl Produkte im Live-Test CSV"
         required: true
@@ -31,7 +27,6 @@ jobs:
       - name: Run Matrixify processor
         env:
           INPUT_CSV: ${{ inputs.INPUT_CSV }}
-          VAT_RATE: ${{ inputs.VAT_RATE }}
           TEST_COUNT: ${{ inputs.TEST_COUNT }}
         run: node src/matrixify-run.mjs
 
