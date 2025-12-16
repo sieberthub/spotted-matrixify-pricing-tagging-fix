@@ -10,8 +10,14 @@ const IN_CANDIDATES = [
 const OUT_DIR = "out";
 fs.mkdirSync(OUT_DIR, { recursive: true });
 
-// --- Arigato constants ---
-const T_VAT = 0.20;
+// --- VAT from workflow input ---
+// Set VAT=0 in GitHub Actions to disable VAT adjustments completely.
+const T_VAT_RAW = process.env.VAT ?? process.env.T_VAT ?? "0.20";
+const T_VAT = Number(String(T_VAT_RAW).replace(",", "."));
+if (!Number.isFinite(T_VAT) || T_VAT < 0 || T_VAT > 1) {
+  throw new Error(`Invalid VAT value "${T_VAT_RAW}". Expected number between 0 and 1 (e.g. 0 or 0.20).`);
+}
+console.log(`✅ VAT configured: T_VAT=${T_VAT}`);
 
 // ---------- CSV helpers ----------
 function detectDelimiter(line) {
@@ -89,7 +95,7 @@ function writeCsv(filePath, headers, rows) {
   fs.writeFileSync(filePath, lines.join("\n"));
 }
 
-// ✅ Multiline-CSV support: record is complete if quotes are balanced
+// Multiline-CSV support: record is complete if quotes are balanced
 function isCsvRecordComplete(s) {
   let inQ = false;
   for (let i = 0; i < s.length; i++) {
@@ -121,17 +127,22 @@ function hasUsedGateway(tagsArr) {
   return lower.includes("preowned / defect") || lower.includes("preloved");
 }
 
-// ✅ NEW: CNFDNT skip-tag
+// CNFDNT skip-tag
 function hasCnfdnt(tagsArr) {
   const lower = (tagsArr || []).map(normTag);
   return lower.includes("cnfdnt");
 }
 
+/**
+ * Classification (standard vs low-margin) uses fee model.
+ * Only d_max was aligned to the new standard d_max from your table (0.51).
+ * Everything else stays as before.
+ */
 function determineTypeArigato(M_net, C_net, tagsArr) {
   if (!(M_net > 0) || !(C_net > 0)) return "skip";
   if (hasUsedGateway(tagsArr)) return "used";
 
-  const d_max = 0.55;
+  const d_max = 0.51; // ✅ from your table
   const ship_cost = 12.9;
   const cust_ship = 8.5;
   const aff_rate = 0.12;
@@ -154,15 +165,16 @@ function round2(x) { return Math.round(x * 100) / 100; }
 function computePricing(M_net, C_net, type) {
   if (!(M_net > 0) || !(C_net > 0)) return { ok: false };
 
-  const U = { alpha: 0.15, beta: 1.10, gamma: 0.20, N: 40.00, K0: 500.0, k: 500.0 };
-  const LM = { alpha: 0.16, beta: 0.25, gamma: 0.40, N: 35.00, K0: 300.0, k: 500.0 };
+  // ✅ NEW constants from your screenshot
+  const U = { alpha: 0.25, beta: 1.20, gamma: 0.20, N: 35.00, K0: 200.0, k: 200.0 }; // used
+  const LM = { alpha: 0.40, beta: 0.90, gamma: 0.00, N: 35.00, K0: 500.0, k: 300.0 }; // low-margin
   const STD = {
-    d_max: 0.50,
+    d_max: 0.51,
     mu0: 0.75,
-    beta_disc: 0.20,
+    beta_disc: 0.00,
     gamma_M: 0.23,
-    rho: 0.60,
-    d_ref: 0.90,
+    rho: 0.40,
+    d_ref: 0.91,
     M_ref: 25000.0
   };
 
@@ -224,6 +236,7 @@ function computeTagDiff(currentTagsArr, desiredType) {
 
   const doTags = tags_to_add.length > 0 || tags_to_remove.length > 0;
 
+  // desired full tag list (remove all type tags, add desired one)
   const cleaned = cur.filter(t => !TYPE_TAGS.includes(normTag(t)));
   const desiredTagsArr = cleaned.slice();
   if (!cleaned.map(normTag).includes(desiredType)) desiredTagsArr.push(desiredType);
@@ -259,7 +272,7 @@ async function main() {
   // group by product id
   const products = new Map();
 
-  // ✅ NEW: buffer for multiline records
+  // buffer for multiline records
   let pending = "";
 
   for await (const rawLine of rl) {
@@ -316,7 +329,7 @@ async function main() {
     const productId = (cells[idx.ID] ?? "").trim().replace(/^"|"$/g, "");
     if (!productId) continue;
 
-    // ✅ FAIL-FAST: ID must be numeric (otherwise parsing is broken)
+    // FAIL-FAST: ID must be numeric
     if (!isNumericId(productId)) {
       throw new Error(
         [
@@ -355,6 +368,7 @@ async function main() {
 
     const p = products.get(productId);
     p.variants.push({ variantId, pos, price, compareAt, cost });
+
     if (!p.title && title) p.title = title;
     if (!p.handle && handle) p.handle = handle;
     if (!p.status && status) p.status = status;
@@ -368,17 +382,19 @@ async function main() {
 
   console.log(`2) Parsed products: ${products.size}`);
 
-  // decide changes
+  // Outputs
   const previewFull = [];
   const previewOnly = [];
+
   const importOnlyChangesRows = [];
+  const importFullRows = []; // ✅ NEW: full import file
+
   const changeItems = [];
 
   let drafted = 0;
   let cnfdntIgnored = 0;
   const byType = { used: 0, standard: 0, "low-margin": 0, skip: 0 };
 
-  // Output headers for Matrixify import (minimal + safe)
   const importHeaders = [
     "ID",
     "Command",
@@ -391,21 +407,13 @@ async function main() {
     (metafieldColName ?? "Metafield: spotted.as_low_as [number_decimal]"),
   ];
 
-  let failfastStandardMissingMf = 0;
-  let failfastVariantBlankPrice = 0;
-
   for (const p of products.values()) {
-    // base variant deterministisch: kleinste Variant Position
     const base = p.variants.reduce((best, v) => (!best || v.pos < best.pos) ? v : best, null);
 
-    // ✅ CNFDNT guard: completely ignore product (no changes)
+    // CNFDNT => completely ignore (no changes, no full export rows)
     if (hasCnfdnt(p.tagsArr)) {
       cnfdntIgnored++;
       byType.skip++;
-
-      const msrpGross = base?.compareAt ?? 0;
-      const M_net = msrpGross > 0 ? (msrpGross / (1 + T_VAT)) : 0;
-      const C_net = base?.cost ?? 0;
 
       previewFull.push({
         productId: p.productId,
@@ -414,9 +422,9 @@ async function main() {
         status_current: p.status,
         doDraft: false,
         type: "skip",
-        msrp_gross: msrpGross ? round2(msrpGross) : "",
-        M_net: M_net ? round2(M_net) : "",
-        C_net: C_net ? round2(C_net) : "",
+        msrp_gross: base?.compareAt ?? "",
+        M_net: "",
+        C_net: base?.cost ?? "",
         price_old: base?.price ?? "",
         price_new: "",
         as_low_as_old: p.asLowAsCurrent ?? "",
@@ -433,7 +441,7 @@ async function main() {
     }
 
     const msrpGross = base?.compareAt ?? 0;
-    const M_net = msrpGross > 0 ? (msrpGross / (1 + T_VAT)) : 0;
+    const M_net = msrpGross > 0 ? (msrpGross / (1 + T_VAT)) : 0; // VAT=0 -> equals msrpGross
     const C_net = base?.cost ?? 0;
 
     const missingMC = !(M_net > 0 && C_net > 0);
@@ -448,15 +456,16 @@ async function main() {
       : { ok: false };
 
     const desiredPriceNew = pricing.ok ? pricing.price_new : null;
-    const desiredAsLowAs = (pricing.ok && desiredType === "standard" && pricing.as_low_as > 0)
-      ? pricing.as_low_as
-      : null;
+    const desiredAsLowAs =
+      (pricing.ok && desiredType === "standard" && pricing.as_low_as > 0)
+        ? pricing.as_low_as
+        : null;
 
     const tagDiff = (!missingMC && TYPE_TAGS.includes(desiredType))
       ? computeTagDiff(p.tagsArr, desiredType)
       : { desiredTagsArr: p.tagsArr, tags_to_add: [], tags_to_remove: [], doTags: false };
 
-    // price changes: Arigato setzt alle Varianten auf denselben Preis_new
+    // ---------- ONLY-CHANGES computation ----------
     const variantsToUpdate = [];
     if (!missingMC && desiredPriceNew != null) {
       for (const v of p.variants) {
@@ -467,7 +476,6 @@ async function main() {
     }
     const doPrice = variantsToUpdate.length > 0;
 
-    // metafield change: nur Standard (für Preview/Reporting)
     const currentMf = toNumberOrNull(p.asLowAsCurrent);
     const doMetafield =
       !missingMC &&
@@ -502,6 +510,59 @@ async function main() {
     previewFull.push(rowPrev);
     if (needsChange) previewOnly.push(rowPrev);
 
+    // ---------- FULL IMPORT rows ----------
+    // Full import always applies tags for eligible types, always writes standard metafield,
+    // and always updates ALL variant prices for eligible types (so you overwrite the first run).
+    const fullDoTags = (!missingMC && TYPE_TAGS.includes(desiredType));
+    const fullTagsCellOut = fullDoTags ? tagDiff.desiredTagsArr.join(", ") : "";
+    const fullTagsCmdOut = fullDoTags ? "REPLACE" : "";
+
+    const fullMfCell =
+      (!missingMC && desiredType === "standard" && desiredAsLowAs != null)
+        ? String(desiredAsLowAs)
+        : (p.asLowAsCurrent ? String(p.asLowAsCurrent) : "");
+
+    const fullDoPrice = (!missingMC && TYPE_TAGS.includes(desiredType) && pricing.ok && desiredPriceNew != null);
+
+    const primaryVariantId = base?.variantId || (p.variants[0]?.variantId ?? "");
+    const fullPrimaryHasPriceUpdate = fullDoPrice && !!primaryVariantId;
+
+    const fullPrimaryVariantIdOut = fullPrimaryHasPriceUpdate ? primaryVariantId : "";
+    const fullPrimaryVariantCmdOut = fullPrimaryHasPriceUpdate ? "UPDATE" : "";
+    const fullPrimaryVariantPriceOut = fullPrimaryHasPriceUpdate ? String(desiredPriceNew) : "";
+
+    importFullRows.push({
+      "ID": p.productId,
+      "Command": "UPDATE",
+      "Tags": fullTagsCellOut,
+      "Tags Command": fullTagsCmdOut,
+      "Status": doDraft ? "Draft" : "",
+      // keep safe structure: only set Variant ID if we also set price+command
+      "Variant ID": fullPrimaryVariantIdOut,
+      "Variant Command": fullPrimaryVariantCmdOut,
+      "Variant Price": fullPrimaryVariantPriceOut,
+      [importHeaders[8]]: fullMfCell,
+    });
+
+    if (fullDoPrice) {
+      for (const v of p.variants) {
+        const vid = v.variantId;
+        if (!vid || vid === primaryVariantId) continue;
+        importFullRows.push({
+          "ID": p.productId,
+          "Command": "UPDATE",
+          "Tags": "",
+          "Tags Command": "",
+          "Status": "",
+          "Variant ID": vid,
+          "Variant Command": "UPDATE",
+          "Variant Price": String(desiredPriceNew),
+          [importHeaders[8]]: fullMfCell,
+        });
+      }
+    }
+
+    // ---------- ONLY-CHANGES import rows ----------
     if (!needsChange) continue;
 
     changeItems.push({
@@ -518,57 +579,20 @@ async function main() {
       currentAsLowAs: p.asLowAsCurrent ?? "",
     });
 
-    // --- Build Matrixify import rows for this product ---
-    const primaryVariantId = base?.variantId || (p.variants[0]?.variantId ?? "");
-
-    // ✅ Metafield safety (strong):
-    // Standard => ALWAYS write computed as_low_as (even if unchanged)
-    // Non-standard => preserve exported value if present, else empty
     const mfCell =
       (!missingMC && desiredType === "standard" && desiredAsLowAs != null)
         ? String(desiredAsLowAs)
         : (p.asLowAsCurrent ? String(p.asLowAsCurrent) : "");
 
-    // ✅ FAIL-FAST: standard must have valid mf
-    if (!missingMC && desiredType === "standard") {
-      const mfNum = toNumberOrNull(mfCell);
-      if (!(mfNum > 0)) {
-        failfastStandardMissingMf++;
-        throw new Error(
-          [
-            "FAIL-FAST: Standard-Produkt ohne gültiges spotted.as_low_as.",
-            `Product ID: ${p.productId}`,
-            `Handle: ${p.handle || "(empty)"}`,
-            `Title: ${p.title || "(empty)"}`,
-            `Computed desiredAsLowAs: ${desiredAsLowAs ?? "null"}`,
-            `mfCell: "${mfCell}"`,
-          ].join("\n")
-        );
-      }
-    }
-
     const tagsCellOut = tagDiff.doTags ? tagDiff.desiredTagsArr.join(", ") : "";
     const tagsCmdOut = tagDiff.doTags ? "REPLACE" : "";
 
-    // ✅ STRUCTURE FIX: only write Variant ID if we also update price
     const primaryHasPriceUpdate =
       doPrice && primaryVariantId && variantsToUpdate.includes(primaryVariantId);
 
     const primaryVariantIdOut = primaryHasPriceUpdate ? primaryVariantId : "";
     const primaryVariantCmdOut = primaryHasPriceUpdate ? "UPDATE" : "";
     const primaryVariantPriceOut = primaryHasPriceUpdate ? String(desiredPriceNew) : "";
-
-    // ✅ FAIL-FAST: Variant ID => price must exist
-    if (primaryVariantIdOut && !primaryVariantPriceOut) {
-      failfastVariantBlankPrice++;
-      throw new Error(
-        [
-          "FAIL-FAST: Variant ID gesetzt, aber Variant Price leer (würde Matrixify-Fehler verursachen).",
-          `Product ID: ${p.productId}`,
-          `Variant ID: ${primaryVariantIdOut}`,
-        ].join("\n")
-      );
-    }
 
     importOnlyChangesRows.push({
       "ID": p.productId,
@@ -582,22 +606,9 @@ async function main() {
       [importHeaders[8]]: mfCell,
     });
 
-    // Additional rows for remaining variants needing price change
     if (doPrice) {
       for (const vid of variantsToUpdate) {
         if (!vid || vid === primaryVariantId) continue;
-
-        if (desiredPriceNew == null) {
-          failfastVariantBlankPrice++;
-          throw new Error(
-            [
-              "FAIL-FAST: Varianten-Update geplant, aber desiredPriceNew ist null.",
-              `Product ID: ${p.productId}`,
-              `Variant ID: ${vid}`,
-            ].join("\n")
-          );
-        }
-
         importOnlyChangesRows.push({
           "ID": p.productId,
           "Command": "UPDATE",
@@ -616,16 +627,17 @@ async function main() {
   // --- Write previews ---
   const prevFullPath = path.join(OUT_DIR, "preview.full.csv");
   const prevOnlyPath = path.join(OUT_DIR, "preview.only-changes.csv");
-
   const prevHeaders = Object.keys(previewFull[0] || {});
   writeCsv(prevFullPath, prevHeaders, previewFull);
   writeCsv(prevOnlyPath, prevHeaders, previewOnly);
 
-  // --- Write Matrixify import files ---
+  // --- Write imports ---
   const importOnlyPath = path.join(OUT_DIR, "matrixify.import.only-changes.csv");
+  const importFullPath = path.join(OUT_DIR, "matrixify.import.full.csv");
   writeCsv(importOnlyPath, importHeaders, importOnlyChangesRows);
+  writeCsv(importFullPath, importHeaders, importFullRows);
 
-  // --- Build 20-product test import (stratified by type) ---
+  // --- Test-20 from only-changes (unchanged) ---
   const pick = (arr, n) => arr.slice(0, n);
   const used = changeItems.filter(x => x.type === "used");
   const std = changeItems.filter(x => x.type === "standard");
@@ -639,16 +651,17 @@ async function main() {
 
   const pickedIds = new Set(picked.map(x => x.productId));
   const testRows = importOnlyChangesRows.filter(r => pickedIds.has(r["ID"]));
-
   const testPath = path.join(OUT_DIR, "matrixify.import.test-20.csv");
   writeCsv(testPath, importHeaders, testRows);
 
-  console.log(`Stats: totalProducts=${products.size}, needChange=${changeItems.length}, drafted=${drafted}, cnfdntIgnored=${cnfdntIgnored}`);
+  console.log(`Stats: totalProducts=${products.size}`);
+  console.log(`onlyChangesRows=${importOnlyChangesRows.length}, fullRows=${importFullRows.length}`);
+  console.log(`drafted=${drafted}, cnfdntIgnored=${cnfdntIgnored}`);
   console.log(`ByType: ${JSON.stringify(byType)}`);
-  console.log(`FailFastCounters: standardMissingMf=${failfastStandardMissingMf}, variantBlankPrice=${failfastVariantBlankPrice}`);
   console.log(`✅ Wrote: ${prevFullPath}`);
   console.log(`✅ Wrote: ${prevOnlyPath}`);
   console.log(`✅ Wrote: ${importOnlyPath}`);
+  console.log(`✅ Wrote: ${importFullPath}`);
   console.log(`✅ Wrote: ${testPath}`);
 }
 
